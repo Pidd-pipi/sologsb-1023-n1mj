@@ -2,7 +2,7 @@
 import { computed, ref, watch } from 'vue';
 import { Message } from '@arco-design/web-vue';
 import { statusLabel, useCollation } from './composables/useCollation';
-import type { AlignmentRow, DifferenceStatus } from './types';
+import type { AlignmentRow, ComparisonRules, DifferenceStatus } from './types';
 
 const {
   versions,
@@ -10,17 +10,21 @@ const {
   rightVersionId,
   rows,
   rules,
+  snapshots,
   selectedRowId,
   selectedRowIds,
   processing,
   progress,
   message,
+  saveFailed,
   canUndo,
   canRedo,
   selectedRow,
   differenceCount,
   acceptedCount,
   unresolvedCount,
+  pendingReviewCount,
+  unfiledCount,
   runAlignment,
   recalculate,
   updateRow,
@@ -28,25 +32,32 @@ const {
   moveRow,
   acceptRows,
   acceptAll,
+  confirmPendingReview,
+  settleUnfiledRows,
   nextDifference,
   addVersion,
+  saveSnapshot,
+  loadSnapshot,
+  removeSnapshot,
   undo,
   redo,
   exportMarkdown,
-  exportJson,
-  commit
+  exportJson
 } = useCollation();
 
 const importVisible = ref(false);
 const onlyDifferences = ref(false);
+const onlyPendingReview = ref(false);
+const onlyUnfiled = ref(false);
 const rowQuery = ref('');
 const noteDraft = ref('');
 const sourceDraft = ref('');
+const snapshotName = ref('');
 const importForm = ref({ name: '', source: '', text: '' });
 const fileInput = ref<HTMLInputElement | null>(null);
 
 const columns = [
-  { title: '状态', dataIndex: 'status', slotName: 'status', width: 122, fixed: 'left' as const },
+  { title: '状态', dataIndex: 'status', slotName: 'status', width: 132, fixed: 'left' as const },
   { title: '底本', dataIndex: 'left', slotName: 'left', width: 330 },
   { title: '对准操作', dataIndex: 'align', slotName: 'align', width: 112, align: 'center' as const },
   { title: '参校本', dataIndex: 'right', slotName: 'right', width: 330 },
@@ -57,6 +68,8 @@ const filteredRows = computed(() => {
   const query = rowQuery.value.trim().toLocaleLowerCase();
   return rows.value.filter((row) => {
     if (onlyDifferences.value && row.status === 'same') return false;
+    if (onlyPendingReview.value && !row.needsReview) return false;
+    if (onlyUnfiled.value && !row.unfiled) return false;
     if (!query) return true;
     return [row.left?.text, row.right?.text, row.note, row.source, statusLabel(row.status)]
       .filter(Boolean)
@@ -94,6 +107,18 @@ function rowClass(record: AlignmentRow) {
   return record.id === selectedRowId.value ? 'row-active' : '';
 }
 
+function rulesSummary(value: ComparisonRules) {
+  const parts: string[] = [];
+  if (value.ignorePunctuation) parts.push('忽略标点');
+  if (value.ignoreVariants) parts.push('忽略异体字');
+  return parts.length ? parts.join(' · ') : '逐字比较';
+}
+
+function formatTime(iso: string) {
+  const date = new Date(iso);
+  return Number.isNaN(date.getTime()) ? iso : date.toLocaleString('zh-CN', { hour12: false });
+}
+
 function onSelectionChange(keys: (string | number)[]) {
   selectedRowIds.value = keys;
 }
@@ -115,6 +140,11 @@ function saveAnnotation() {
     source: sourceDraft.value.trim()
   });
   Message.success('校勘说明已保存');
+}
+
+function onSaveSnapshot() {
+  saveSnapshot(snapshotName.value);
+  snapshotName.value = '';
 }
 
 function download(filename: string, text: string, type: string) {
@@ -200,7 +230,7 @@ window.addEventListener('beforeunload', beforeUnload);
         <div class="brand-mark">校</div>
         <div>
           <h1 class="brand-title">校异斋 · 多版本校勘台</h1>
-          <div class="brand-subtitle">自动对齐、人工修正、校记导出，全程本地保存</div>
+          <div class="brand-subtitle">自动对齐、人工修正、快照留存、校记导出，全程本地保存</div>
         </div>
         <a-space style="margin-left: auto" wrap>
           <a-button :disabled="!canUndo" @click="undo">撤销</a-button>
@@ -246,7 +276,30 @@ window.addEventListener('beforeunload', beforeUnload);
             <a-checkbox v-model="rules.ignoreVariants" @change="recalculate">忽略常见异体字</a-checkbox>
           </a-space>
           <div style="margin-top: 10px; color: #86909c; font-size: 12px; line-height: 1.6">
-            规则只影响相同/改动判断，原始正文始终保留；重算会进入撤销历史。
+            规则变化只让判断受影响的记录回到待复核，校记与来源保留；未受影响的已接受记录不动。
+          </div>
+        </section>
+
+        <section class="panel-section">
+          <h2 class="panel-title">版本快照</h2>
+          <div style="display: flex; gap: 8px">
+            <a-input v-model="snapshotName" placeholder="快照名称，如：卷三初校" allow-clear @press-enter="onSaveSnapshot" />
+            <a-button type="primary" @click="onSaveSnapshot">保存</a-button>
+          </div>
+          <div style="margin-top: 8px; color: #86909c; font-size: 12px; line-height: 1.6">
+            快照把校勘记录与当时的比较规则一起固化，句段编号跨快照沿用。
+          </div>
+          <a-empty v-if="!snapshots.length" description="尚未保存快照" :image-size="60" style="margin-top: 10px" />
+          <div v-for="item in snapshots" :key="item.id" class="snapshot-item">
+            <div class="snapshot-name">{{ item.name }}</div>
+            <div class="snapshot-meta">
+              {{ formatTime(item.createdAt) }} · {{ item.rows.length }} 句段 / {{ item.differenceCount }} 差异
+            </div>
+            <div class="snapshot-meta">规则：{{ rulesSummary(item.rules) }}</div>
+            <div style="margin-top: 8px; display: flex; gap: 8px">
+              <a-button size="mini" type="outline" @click="loadSnapshot(item.id)">载入</a-button>
+              <a-button size="mini" status="danger" @click="removeSnapshot(item.id)">删除</a-button>
+            </div>
           </div>
         </section>
 
@@ -269,9 +322,30 @@ window.addEventListener('beforeunload', beforeUnload);
               <div class="stat-number">{{ rows.length }}</div>
               <div class="stat-label">对齐句段</div>
             </div>
+            <div class="stat-card">
+              <div class="stat-number" style="color: #d4380d">{{ pendingReviewCount }}</div>
+              <div class="stat-label">待复核</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-number" style="color: #722ed1">{{ unfiledCount }}</div>
+              <div class="stat-label">待整理</div>
+            </div>
           </div>
           <a-button long type="primary" status="success" style="margin-top: 12px" :disabled="!unresolvedCount" @click="acceptAll">
             批量接受全部建议
+          </a-button>
+          <a-button
+            v-if="pendingReviewCount"
+            long
+            type="primary"
+            status="warning"
+            style="margin-top: 8px"
+            @click="confirmPendingReview"
+          >
+            确认全部待复核（{{ pendingReviewCount }}）
+          </a-button>
+          <a-button v-if="unfiledCount" long style="margin-top: 8px" @click="settleUnfiledRows">
+            确认旧稿编号整理（{{ unfiledCount }}）
           </a-button>
           <a-button long style="margin-top: 8px" @click="nextDifference">跳到下一处未接受差异</a-button>
         </section>
@@ -290,9 +364,13 @@ window.addEventListener('beforeunload', beforeUnload);
       <a-layout-content class="center-panel">
         <a-card :bordered="false" style="margin-bottom: 12px">
           <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap">
-            <a-input-search v-model="rowQuery" placeholder="搜索正文、校记或来源" allow-clear style="max-width: 360px" />
+            <a-input-search v-model="rowQuery" placeholder="搜索正文、校记或来源" allow-clear style="max-width: 320px" />
             <a-checkbox v-model="onlyDifferences">只看差异</a-checkbox>
+            <a-checkbox v-model="onlyPendingReview">只看待复核</a-checkbox>
+            <a-checkbox v-model="onlyUnfiled">只看待整理</a-checkbox>
             <a-tag color="arcoblue">{{ filteredRows.length }} / {{ rows.length }} 行</a-tag>
+            <a-tag v-if="pendingReviewCount" color="orangered">{{ pendingReviewCount }} 条待复核</a-tag>
+            <a-tag v-if="unfiledCount" color="purple">{{ unfiledCount }} 条待整理</a-tag>
             <a-tag v-if="selectedRowIds.length" color="green">{{ selectedRowIds.length }} 行已勾选</a-tag>
             <a-button
               v-if="selectedRowIds.length"
@@ -308,7 +386,11 @@ window.addEventListener('beforeunload', beforeUnload);
         </a-card>
 
         <a-card :bordered="false" :body-style="{ padding: 0 }">
-          <a-alert :show-icon="processing" :type="unresolvedCount ? 'warning' : 'success'" style="border-radius: 0">
+          <a-alert
+            :show-icon="processing || saveFailed"
+            :type="saveFailed ? 'error' : unresolvedCount ? 'warning' : 'success'"
+            style="border-radius: 0"
+          >
             {{ message }}<span v-if="unresolvedCount"> · {{ unresolvedCount }} 条差异尚未接受</span>
           </a-alert>
           <a-table
@@ -329,8 +411,12 @@ window.addEventListener('beforeunload', beforeUnload);
                 {{ statusLabel(record.status) }}
               </a-tag>
               <div style="margin-top: 6px; color: #86909c; font-size: 11px">
-                相似度 {{ Math.round(record.similarity * 100) }}%
+                句段 #{{ record.seq }} · 相似度 {{ Math.round(record.similarity * 100) }}%
               </div>
+              <a-tooltip v-if="record.needsReview" :content="record.reviewReason || '待复核'">
+                <a-tag size="small" color="orangered" style="margin-top: 4px">待复核</a-tag>
+              </a-tooltip>
+              <a-tag v-if="record.unfiled" size="small" color="purple" style="margin-top: 4px">待整理</a-tag>
               <div v-if="record.manuallyAdjusted" style="margin-top: 4px; color: #165dff; font-size: 11px">人工调整</div>
             </template>
 
@@ -371,6 +457,7 @@ window.addEventListener('beforeunload', beforeUnload);
                 <div>{{ record.note || '尚未填写校勘说明' }}</div>
                 <div v-if="record.source" style="margin-top: 5px; color: #86909c">来源：{{ record.source }}</div>
                 <a-tag v-if="record.accepted" size="small" color="green" style="margin-top: 7px">已接受</a-tag>
+                <a-tag v-else-if="record.needsReview" size="small" color="orangered" style="margin-top: 7px">待复核</a-tag>
                 <a-tag v-else size="small" color="orange" style="margin-top: 7px">待处理</a-tag>
               </div>
             </template>
@@ -391,6 +478,15 @@ window.addEventListener('beforeunload', beforeUnload);
         </section>
 
         <template v-if="selectedRow">
+          <section v-if="selectedRow.needsReview" class="panel-section">
+            <a-alert type="warning" :show-icon="true" style="margin-bottom: 10px">
+              {{ selectedRow.reviewReason || '这条记录待复核' }}
+            </a-alert>
+            <a-button long type="primary" status="warning" @click="acceptRows([selectedRow.id])">
+              确认这条复核结果
+            </a-button>
+          </section>
+
           <section class="panel-section">
             <div style="margin-bottom: 10px; color: #86909c; font-size: 12px">判断类别</div>
             <a-select :model-value="selectedRow.status" style="width: 100%" @change="updateStatus">
@@ -403,7 +499,7 @@ window.addEventListener('beforeunload', beforeUnload);
           </section>
 
           <section class="panel-section">
-            <div style="margin-bottom: 10px; color: #86909c; font-size: 12px">底本 / 参校本</div>
+            <div style="margin-bottom: 10px; color: #86909c; font-size: 12px">底本 / 参校本 · 句段 #{{ selectedRow.seq }}</div>
             <div class="diff-text same">{{ selectedRow.left?.text || '（无）' }}</div>
             <div style="height: 8px" />
             <div class="diff-text changed">{{ selectedRow.right?.text || '（无）' }}</div>
@@ -455,7 +551,7 @@ window.addEventListener('beforeunload', beforeUnload);
         <section class="panel-section" style="margin-top: auto">
           <div style="color: #86909c; font-size: 11px; line-height: 1.7">
             最近状态：{{ message }}<br />
-            数据保存在当前浏览器，刷新后继续。
+            数据保存在当前浏览器，保存失败会自动恢复上一份草稿。
           </div>
         </section>
       </a-layout-sider>

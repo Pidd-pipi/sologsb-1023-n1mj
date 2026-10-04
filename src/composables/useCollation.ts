@@ -2,6 +2,7 @@ import { computed, onMounted, ref, watch } from 'vue';
 import { sampleVersions, splitIntoUnits } from '../data';
 import type {
   AlignmentRow,
+  CollationSnapshot,
   ComparisonRules,
   DifferenceStatus,
   PersistedCollationState,
@@ -10,6 +11,8 @@ import type {
 } from '../types';
 
 const STORAGE_KEY = 'sologsb-1023/multi-version-collation/v1';
+const BACKUP_KEY = `${STORAGE_KEY}/backup`;
+const MAX_SNAPSHOTS = 12;
 
 const variantMap: Record<string, string> = {
   為: '为',
@@ -34,8 +37,9 @@ const variantMap: Record<string, string> = {
   國: '国'
 };
 
+/** 状态均可 JSON 序列化（本地持久化的前提），用 JSON 往返同时剥离响应式代理 */
 function clone<T>(value: T): T {
-  return structuredClone(value);
+  return JSON.parse(JSON.stringify(value)) as T;
 }
 
 function yieldToBrowser() {
@@ -84,6 +88,7 @@ async function alignUnits(
   leftUnits: TextUnit[],
   rightUnits: TextUnit[],
   rules: ComparisonRules,
+  allocateSeq: () => number,
   onProgress: (value: number) => void
 ): Promise<AlignmentRow[]> {
   const rows: AlignmentRow[] = [];
@@ -95,10 +100,10 @@ async function alignUnits(
     const right = rightUnits[rightIndex];
 
     if (!left) {
-      rows.push(makeRow(undefined, right, rules, '自动补齐右侧新增内容'));
+      rows.push(makeRow(undefined, right, rules, '自动补齐右侧新增内容', allocateSeq()));
       rightIndex += 1;
     } else if (!right) {
-      rows.push(makeRow(left, undefined, rules, '自动标记左侧缺失内容'));
+      rows.push(makeRow(left, undefined, rules, '自动标记左侧缺失内容', allocateSeq()));
       leftIndex += 1;
     } else {
       const sameParagraph =
@@ -117,6 +122,7 @@ async function alignUnits(
         const score = Number(ratio.toFixed(3));
         rows.push({
           id: `row-${rows.length + 1}-${left.id}-${right.id}`,
+          seq: allocateSeq(),
           left,
           right,
           status: statusFor(left, right, score),
@@ -129,10 +135,10 @@ async function alignUnits(
         leftIndex += 1;
         rightIndex += 1;
       } else if (nextRightRatio > ratio && nextRightRatio > nextLeftRatio) {
-        rows.push(makeRow(undefined, right, rules, '右侧有段落或句子插入'));
+        rows.push(makeRow(undefined, right, rules, '右侧有段落或句子插入', allocateSeq()));
         rightIndex += 1;
       } else {
-        rows.push(makeRow(left, undefined, rules, '左侧有段落或句子缺失'));
+        rows.push(makeRow(left, undefined, rules, '左侧有段落或句子缺失', allocateSeq()));
         leftIndex += 1;
       }
     }
@@ -150,11 +156,13 @@ function makeRow(
   left: TextUnit | undefined,
   right: TextUnit | undefined,
   rules: ComparisonRules,
-  source: string
+  source: string,
+  seq: number
 ): AlignmentRow {
   const score = left && right ? Number(similarity(normalized(left.text, rules), normalized(right.text, rules)).toFixed(3)) : 0;
   return {
     id: `row-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+    seq,
     left,
     right,
     status: statusFor(left, right, score),
@@ -170,17 +178,39 @@ function defaultRules(): ComparisonRules {
   return { ignorePunctuation: true, ignoreVariants: true, candidateWindow: 3 };
 }
 
+/**
+ * 兼容旧稿：缺句段编号的记录按顺序补齐编号并标记为待整理，
+ * 返回推进后的发号器位置，保证编号跨快照、跨会话不重复。
+ */
+function ensureSeq(list: AlignmentRow[], start: number) {
+  let max = 0;
+  for (const row of list) {
+    if (typeof row.seq === 'number' && Number.isFinite(row.seq)) max = Math.max(max, row.seq);
+  }
+  let cursor = Math.max(start, max + 1, 1);
+  for (const row of list) {
+    if (typeof row.seq !== 'number' || !Number.isFinite(row.seq)) {
+      row.seq = cursor++;
+      row.unfiled = true;
+    }
+  }
+  return cursor;
+}
+
 export function useCollation() {
   const versions = ref<VersionDocument[]>(clone(sampleVersions));
   const leftVersionId = ref(versions.value[0].id);
   const rightVersionId = ref(versions.value[1].id);
   const rows = ref<AlignmentRow[]>([]);
   const rules = ref<ComparisonRules>(defaultRules());
+  const snapshots = ref<CollationSnapshot[]>([]);
+  const nextSeq = ref(1);
   const selectedRowId = ref('');
   const selectedRowIds = ref<(string | number)[]>([]);
   const processing = ref(false);
   const progress = ref(0);
   const message = ref('正在载入本地校勘数据…');
+  const saveFailed = ref(false);
   const history = ref<string[]>([]);
   const future = ref<string[]>([]);
   const canUndo = computed(() => history.value.length > 0);
@@ -191,21 +221,71 @@ export function useCollation() {
   const differenceCount = computed(() => rows.value.filter((row) => row.status !== 'same').length);
   const acceptedCount = computed(() => rows.value.filter((row) => row.accepted).length);
   const unresolvedCount = computed(() => rows.value.filter((row) => !row.accepted && row.status !== 'same').length);
+  const pendingReviewCount = computed(() => rows.value.filter((row) => row.needsReview).length);
+  const unfiledCount = computed(() => rows.value.filter((row) => row.unfiled).length);
+
+  /** 最近一次成功写入的草稿，保存失败时用于恢复 */
+  let lastGood: string | null = null;
 
   function snapshot(): string {
     const data: PersistedCollationState = {
+      schemaVersion: 2,
       versions: versions.value,
       leftVersionId: leftVersionId.value,
       rightVersionId: rightVersionId.value,
       rows: rows.value,
       rules: rules.value,
-      selectedRowId: selectedRowId.value
+      selectedRowId: selectedRowId.value,
+      snapshots: snapshots.value,
+      nextSeq: nextSeq.value
     };
     return JSON.stringify(data);
   }
 
+  function safeRead(key: string) {
+    try {
+      return localStorage.getItem(key);
+    } catch {
+      return null;
+    }
+  }
+
   function persist() {
-    localStorage.setItem(STORAGE_KEY, snapshot());
+    const data = snapshot();
+    try {
+      localStorage.setItem(STORAGE_KEY, data);
+      lastGood = data;
+      saveFailed.value = false;
+      try {
+        localStorage.setItem(BACKUP_KEY, data);
+      } catch {
+        /* 备份写入失败不阻塞主流程 */
+      }
+    } catch {
+      saveFailed.value = true;
+      recoverDraft();
+    }
+  }
+
+  /** 保存失败（多为本地空间不足）时回滚到上一份成功保存的草稿 */
+  function recoverDraft() {
+    const fallback = lastGood ?? safeRead(BACKUP_KEY);
+    if (fallback) {
+      try {
+        applyState(JSON.parse(fallback) as PersistedCollationState);
+        message.value = '保存失败：本地空间不足，已恢复之前的草稿';
+        try {
+          localStorage.setItem(STORAGE_KEY, fallback);
+          saveFailed.value = false;
+        } catch {
+          /* 仍写不进则保留内存草稿，由用户导出备份 */
+        }
+        return;
+      } catch {
+        /* 备份草稿也已损坏，走下面的提示 */
+      }
+    }
+    message.value = '保存失败且无法恢复草稿，请立即导出 JSON 备份当前工作';
   }
 
   function commit(label: string, mutate: () => void) {
@@ -217,14 +297,21 @@ export function useCollation() {
     persist();
   }
 
+  function applyState(parsed: PersistedCollationState) {
+    versions.value = parsed.versions ?? [];
+    leftVersionId.value = parsed.leftVersionId ?? versions.value[0]?.id ?? '';
+    rightVersionId.value = parsed.rightVersionId ?? versions.value[1]?.id ?? '';
+    rules.value = { ...defaultRules(), ...(parsed.rules ?? {}) };
+    snapshots.value = parsed.snapshots ?? [];
+    const list = parsed.rows ?? [];
+    nextSeq.value = ensureSeq(list, parsed.nextSeq ?? 1);
+    rows.value = list;
+    selectedRowId.value = parsed.selectedRowId ?? '';
+    selectedRowIds.value = [];
+  }
+
   function restore(raw: string) {
-    const parsed = JSON.parse(raw) as PersistedCollationState;
-    versions.value = parsed.versions;
-    leftVersionId.value = parsed.leftVersionId;
-    rightVersionId.value = parsed.rightVersionId;
-    rows.value = parsed.rows;
-    rules.value = parsed.rules;
-    selectedRowId.value = parsed.selectedRowId;
+    applyState(JSON.parse(raw) as PersistedCollationState);
     persist();
   }
 
@@ -251,9 +338,15 @@ export function useCollation() {
     message.value = '正在分片执行自动对齐…';
     const previous = commitHistory ? snapshot() : '';
     try {
-      const result = await alignUnits(leftVersion.value.units, rightVersion.value.units, rules.value, (value) => {
-        progress.value = value;
-      });
+      const result = await alignUnits(
+        leftVersion.value.units,
+        rightVersion.value.units,
+        rules.value,
+        () => nextSeq.value++,
+        (value) => {
+          progress.value = value;
+        }
+      );
       if (commitHistory) {
         history.value.push(previous);
         future.value = [];
@@ -268,23 +361,48 @@ export function useCollation() {
     }
   }
 
+  /**
+   * 比较规则调整后定向重算：只有判断真正发生变化的记录回到待复核，
+   * 校勘说明和来源原样保留；未受影响的记录（含已接受的）不动。
+   */
   function recalculate() {
+    let affected = 0;
     commit('已按比较规则重算差异', () => {
       rows.value = rows.value.map((row) => {
         if (!row.left || !row.right) return row;
         const score = Number(
           similarity(normalized(row.left.text, rules.value), normalized(row.right.text, rules.value)).toFixed(3)
         );
-        return { ...row, similarity: score, status: statusFor(row.left, row.right, score) };
+        const nextStatus = statusFor(row.left, row.right, score);
+        if (nextStatus === row.status && Math.abs(score - row.similarity) < 0.0005) return row;
+        affected += 1;
+        return {
+          ...row,
+          similarity: score,
+          status: nextStatus,
+          accepted: false,
+          needsReview: true,
+          reviewReason: '比较规则调整后判断有变化，待复核'
+        };
       });
       selectedRowIds.value = [];
     });
+    if (affected) {
+      message.value = `规则已调整：${affected} 条记录判断有变化，待复核；校记与来源已保留`;
+    } else {
+      message.value = '规则已调整：没有记录的判断发生变化，已接受的校记不受影响';
+    }
   }
 
   function updateRow(id: string, patch: Partial<AlignmentRow>) {
     commit('已更新校勘行', () => {
       const row = rows.value.find((item) => item.id === id);
-      if (row) Object.assign(row, patch, { manuallyAdjusted: true });
+      if (!row) return;
+      Object.assign(row, patch, { manuallyAdjusted: true });
+      if (patch.status !== undefined || patch.accepted !== undefined) {
+        row.needsReview = false;
+        row.reviewReason = undefined;
+      }
     });
   }
 
@@ -329,7 +447,11 @@ export function useCollation() {
     commit(`已接受 ${ids.length} 条校对建议`, () => {
       const selected = new Set(ids);
       rows.value.forEach((row) => {
-        if (selected.has(row.id)) row.accepted = true;
+        if (selected.has(row.id)) {
+          row.accepted = true;
+          row.needsReview = false;
+          row.reviewReason = undefined;
+        }
       });
       selectedRowIds.value = [];
     });
@@ -339,8 +461,37 @@ export function useCollation() {
     commit('已批量接受全部差异建议', () => {
       rows.value.forEach((row) => {
         row.accepted = true;
+        row.needsReview = false;
+        row.reviewReason = undefined;
       });
       selectedRowIds.value = [];
+    });
+  }
+
+  /** 待复核记录确认后一次写入 */
+  function confirmPendingReview() {
+    const count = pendingReviewCount.value;
+    if (!count) return;
+    commit(`已一次确认 ${count} 条待复核记录`, () => {
+      rows.value.forEach((row) => {
+        if (row.needsReview) {
+          row.needsReview = false;
+          row.reviewReason = undefined;
+          row.accepted = true;
+        }
+      });
+      selectedRowIds.value = [];
+    });
+  }
+
+  /** 旧稿补齐编号的记录确认整理后一次写入 */
+  function settleUnfiledRows() {
+    const count = unfiledCount.value;
+    if (!count) return;
+    commit(`已确认 ${count} 条补齐编号的旧稿记录`, () => {
+      rows.value.forEach((row) => {
+        if (row.unfiled) row.unfiled = false;
+      });
     });
   }
 
@@ -376,6 +527,48 @@ export function useCollation() {
     void runAlignment();
   }
 
+  /** 保存版本快照：校勘记录与当时的比较规则一起固化 */
+  function saveSnapshot(name?: string) {
+    const label = name?.trim() || `快照 ${snapshots.value.length + 1}`;
+    const item: CollationSnapshot = {
+      id: `snap-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+      name: label,
+      createdAt: new Date().toISOString(),
+      leftVersionId: leftVersionId.value,
+      rightVersionId: rightVersionId.value,
+      rules: clone(rules.value),
+      rows: clone(rows.value),
+      differenceCount: rows.value.filter((row) => row.status !== 'same').length
+    };
+    commit(`已保存版本快照：${label}`, () => {
+      snapshots.value.push(item);
+      if (snapshots.value.length > MAX_SNAPSHOTS) snapshots.value.shift();
+    });
+  }
+
+  /** 载入快照：句段编号沿用快照内的编号，发号器推进到最大编号之后 */
+  function loadSnapshot(id: string) {
+    const item = snapshots.value.find((entry) => entry.id === id);
+    if (!item) return;
+    commit(`已载入版本快照：${item.name}`, () => {
+      rows.value = clone(item.rows);
+      rules.value = { ...defaultRules(), ...clone(item.rules) };
+      leftVersionId.value = item.leftVersionId;
+      rightVersionId.value = item.rightVersionId;
+      nextSeq.value = ensureSeq(rows.value, nextSeq.value);
+      selectedRowId.value = rows.value.find((row) => row.status !== 'same')?.id ?? rows.value[0]?.id ?? '';
+      selectedRowIds.value = [];
+    });
+  }
+
+  function removeSnapshot(id: string) {
+    const item = snapshots.value.find((entry) => entry.id === id);
+    if (!item) return;
+    commit(`已删除版本快照：${item.name}`, () => {
+      snapshots.value = snapshots.value.filter((entry) => entry.id !== id);
+    });
+  }
+
   function exportMarkdown() {
     const changed = rows.value.filter((row) => row.status !== 'same' || row.note || row.source);
     const lines = [
@@ -386,13 +579,14 @@ export function useCollation() {
       `- 比较规则：${rules.value.ignorePunctuation ? '忽略标点；' : ''}${rules.value.ignoreVariants ? '忽略异体字；' : ''}保留正文。`,
       `- 导出时间：${new Date().toLocaleString('zh-CN')}`,
       '',
-      '| 序 | 类别 | 底本 | 参校本 | 校记 | 来源 | 状态 |',
+      '| 句段 | 类别 | 底本 | 参校本 | 校记 | 来源 | 状态 |',
       '|---|---|---|---|---|---|---|'
     ];
-    changed.forEach((row, index) => {
+    changed.forEach((row) => {
       const cell = (value?: string) => (value ?? '').replaceAll('|', '\\|').replaceAll('\n', ' ');
+      const state = row.accepted ? '已接受' : row.needsReview ? '待复核' : '待处理';
       lines.push(
-        `| ${index + 1} | ${statusLabel(row.status)} | ${cell(row.left?.text)} | ${cell(row.right?.text)} | ${cell(row.note)} | ${cell(row.source)} | ${row.accepted ? '已接受' : '待处理'} |`
+        `| ${row.seq} | ${statusLabel(row.status)} | ${cell(row.left?.text)} | ${cell(row.right?.text)} | ${cell(row.note)} | ${cell(row.source)} | ${state} |`
       );
     });
     lines.push('', `共 ${changed.length} 条校勘记录。`);
@@ -402,10 +596,13 @@ export function useCollation() {
   function exportJson() {
     return JSON.stringify(
       {
+        schemaVersion: 2,
         left: leftVersion.value,
         right: rightVersion.value,
         rules: rules.value,
         rows: rows.value,
+        snapshots: snapshots.value,
+        nextSeq: nextSeq.value,
         exportedAt: new Date().toISOString()
       },
       null,
@@ -414,19 +611,22 @@ export function useCollation() {
   }
 
   onMounted(() => {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        restore(raw);
-        message.value = '已恢复浏览器中的校勘草稿';
-      } else {
-        message.value = '已载入示例版本，正在自动对齐…';
-        void runAlignment(false);
+    const raw = safeRead(STORAGE_KEY);
+    const backup = safeRead(BACKUP_KEY);
+    for (const candidate of [raw, backup]) {
+      if (!candidate) continue;
+      try {
+        applyState(JSON.parse(candidate) as PersistedCollationState);
+        lastGood = candidate;
+        message.value = candidate === raw ? '已恢复浏览器中的校勘草稿' : '主草稿不可用，已从备份恢复校勘草稿';
+        if (candidate !== raw) persist();
+        return;
+      } catch {
+        /* 当前候选损坏，尝试下一份 */
       }
-    } catch {
-      message.value = '本地草稿读取失败，已载入示例数据';
-      void runAlignment(false);
     }
+    message.value = '已载入示例版本，正在自动对齐…';
+    void runAlignment(false);
   });
 
   watch(
@@ -442,11 +642,13 @@ export function useCollation() {
     rightVersionId,
     rows,
     rules,
+    snapshots,
     selectedRowId,
     selectedRowIds,
     processing,
     progress,
     message,
+    saveFailed,
     history,
     future,
     canUndo,
@@ -457,6 +659,8 @@ export function useCollation() {
     differenceCount,
     acceptedCount,
     unresolvedCount,
+    pendingReviewCount,
+    unfiledCount,
     runAlignment,
     recalculate,
     updateRow,
@@ -464,8 +668,13 @@ export function useCollation() {
     moveRow,
     acceptRows,
     acceptAll,
+    confirmPendingReview,
+    settleUnfiledRows,
     nextDifference,
     addVersion,
+    saveSnapshot,
+    loadSnapshot,
+    removeSnapshot,
     undo,
     redo,
     exportMarkdown,

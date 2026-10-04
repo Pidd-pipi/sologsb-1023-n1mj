@@ -208,6 +208,28 @@ textarea {
   background: #f7f8fa;
 }
 
+.snapshot-item {
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid #e5e6eb;
+  border-radius: 9px;
+  background: #fff;
+}
+
+.snapshot-name {
+  color: #1d2129;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.snapshot-meta {
+  margin-top: 3px;
+  color: #86909c;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
 @media (max-width: 1100px) {
   .main-layout {
     display: block !important;
