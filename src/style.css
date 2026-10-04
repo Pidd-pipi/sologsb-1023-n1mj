@@ -152,6 +152,46 @@ textarea {
   background: #e8f3ff !important;
 }
 
+.row-review {
+  background: #fff7e8 !important;
+}
+
+.row-review.row-active {
+  background: #e8f3ff !important;
+}
+
+.organize-list {
+  display: grid;
+  gap: 8px;
+  max-height: 240px;
+  overflow: auto;
+}
+
+.organize-item {
+  padding: 8px 10px;
+  border: 1px solid #f2d9b5;
+  border-radius: 8px;
+  background: #fffdf7;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.organize-item:hover {
+  background: #fff7e8;
+}
+
+.organize-meta {
+  color: #86909c;
+  font-size: 11px;
+}
+
+.organize-text {
+  margin-top: 2px;
+  color: #4e5969;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
 .virtual-table .arco-table-td {
   vertical-align: top;
 }

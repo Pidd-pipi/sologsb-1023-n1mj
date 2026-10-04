@@ -2,7 +2,7 @@
 import { computed, ref, watch } from 'vue';
 import { Message } from '@arco-design/web-vue';
 import { statusLabel, useCollation } from './composables/useCollation';
-import type { AlignmentRow, DifferenceStatus } from './types';
+import type { AlignmentRow, DifferenceStatus, TextUnit } from './types';
 
 const {
   versions,
@@ -21,6 +21,10 @@ const {
   differenceCount,
   acceptedCount,
   unresolvedCount,
+  reviewCount,
+  pendingOrganize,
+  pendingOrganizeCount,
+  reviewOnly,
   runAlignment,
   recalculate,
   updateRow,
@@ -28,6 +32,11 @@ const {
   moveRow,
   acceptRows,
   acceptAll,
+  applySuggestion,
+  keepStatus,
+  confirmAllReviews,
+  dismissOrganize,
+  dismissAllOrganize,
   nextDifference,
   addVersion,
   undo,
@@ -46,9 +55,9 @@ const importForm = ref({ name: '', source: '', text: '' });
 const fileInput = ref<HTMLInputElement | null>(null);
 
 const columns = [
-  { title: '状态', dataIndex: 'status', slotName: 'status', width: 122, fixed: 'left' as const },
+  { title: '状态', dataIndex: 'status', slotName: 'status', width: 132, fixed: 'left' as const },
   { title: '底本', dataIndex: 'left', slotName: 'left', width: 330 },
-  { title: '对准操作', dataIndex: 'align', slotName: 'align', width: 112, align: 'center' as const },
+  { title: '对准操作', dataIndex: 'align', slotName: 'align', width: 150, align: 'center' as const },
   { title: '参校本', dataIndex: 'right', slotName: 'right', width: 330 },
   { title: '校记 / 来源', dataIndex: 'note', slotName: 'note', width: 240 }
 ];
@@ -57,11 +66,28 @@ const filteredRows = computed(() => {
   const query = rowQuery.value.trim().toLocaleLowerCase();
   return rows.value.filter((row) => {
     if (onlyDifferences.value && row.status === 'same') return false;
+    if (reviewOnly.value && !row.needsReview) return false;
     if (!query) return true;
     return [row.left?.text, row.right?.text, row.note, row.source, statusLabel(row.status)]
       .filter(Boolean)
       .some((value) => value!.toLocaleLowerCase().includes(query));
   });
+});
+
+/** 待整理区：缺编号被补齐的句段，连同所属版本与所在行 */
+const pendingOrganizeUnits = computed<{ unit: TextUnit; versionName: string; rowId: string }[]>(() => {
+  const result: { unit: TextUnit; versionName: string; rowId: string }[] = [];
+  for (const unitId of pendingOrganize.value) {
+    for (const version of versions.value) {
+      const unit = version.units.find((item) => item.id === unitId);
+      if (unit) {
+        const row = rows.value.find((item) => item.left?.id === unitId || item.right?.id === unitId);
+        result.push({ unit, versionName: version.name, rowId: row?.id ?? '' });
+        break;
+      }
+    }
+  }
+  return result;
 });
 
 const rowSelection = computed(() => ({
@@ -91,11 +117,15 @@ function statusColor(status: DifferenceStatus) {
 }
 
 function rowClass(record: AlignmentRow) {
-  return record.id === selectedRowId.value ? 'row-active' : '';
+  return [record.id === selectedRowId.value ? 'row-active' : '', record.needsReview ? 'row-review' : ''].filter(Boolean).join(' ');
 }
 
 function onSelectionChange(keys: (string | number)[]) {
   selectedRowIds.value = keys;
+}
+
+function jumpToUnit(rowId: string) {
+  if (rowId) selectedRowId.value = rowId;
 }
 
 function updateStatus(status: unknown) {
@@ -269,11 +299,43 @@ window.addEventListener('beforeunload', beforeUnload);
               <div class="stat-number">{{ rows.length }}</div>
               <div class="stat-label">对齐句段</div>
             </div>
+            <div class="stat-card">
+              <div class="stat-number" style="color: #f53f3f">{{ reviewCount }}</div>
+              <div class="stat-label">待复核</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-number" style="color: #722ed1">{{ pendingOrganizeCount }}</div>
+              <div class="stat-label">待整理编号</div>
+            </div>
           </div>
           <a-button long type="primary" status="success" style="margin-top: 12px" :disabled="!unresolvedCount" @click="acceptAll">
             批量接受全部建议
           </a-button>
+          <a-button long type="primary" status="warning" style="margin-top: 8px" :disabled="!reviewCount" @click="confirmAllReviews">
+            一次确认全部待复核（{{ reviewCount }}）
+          </a-button>
           <a-button long style="margin-top: 8px" @click="nextDifference">跳到下一处未接受差异</a-button>
+        </section>
+
+        <section v-if="pendingOrganizeCount" class="panel-section">
+          <h2 class="panel-title">待整理区</h2>
+          <a-alert type="warning" :show-icon="true" style="margin-bottom: 10px">
+            旧稿缺少句段编号，已自动补齐，请核对后标记整理完成。
+          </a-alert>
+          <div class="organize-list">
+            <div
+              v-for="item in pendingOrganizeUnits"
+              :key="item.unit.id"
+              class="organize-item"
+              @click="jumpToUnit(item.rowId)"
+            >
+              <div class="organize-meta">
+                {{ item.versionName }} · 段 {{ item.unit.paragraphOrder }} · 句 {{ item.unit.sentenceOrder }}
+              </div>
+              <div class="organize-text">{{ item.unit.text }}</div>
+            </div>
+          </div>
+          <a-button long style="margin-top: 10px" @click="dismissAllOrganize">全部标记已整理</a-button>
         </section>
 
         <section class="panel-section">
@@ -292,14 +354,26 @@ window.addEventListener('beforeunload', beforeUnload);
           <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap">
             <a-input-search v-model="rowQuery" placeholder="搜索正文、校记或来源" allow-clear style="max-width: 360px" />
             <a-checkbox v-model="onlyDifferences">只看差异</a-checkbox>
+            <a-checkbox v-model="reviewOnly">只看待复核</a-checkbox>
             <a-tag color="arcoblue">{{ filteredRows.length }} / {{ rows.length }} 行</a-tag>
+            <a-tag v-if="reviewCount" color="red">{{ reviewCount }} 条待复核</a-tag>
             <a-tag v-if="selectedRowIds.length" color="green">{{ selectedRowIds.length }} 行已勾选</a-tag>
+            <a-button
+              v-if="reviewCount"
+              type="primary"
+              status="warning"
+              size="small"
+              style="margin-left: auto"
+              @click="confirmAllReviews"
+            >
+              一次确认全部待复核
+            </a-button>
             <a-button
               v-if="selectedRowIds.length"
               type="primary"
               status="success"
               size="small"
-              style="margin-left: auto"
+              :style="reviewCount ? '' : 'margin-left: auto'"
               @click="acceptRows(selectedRowIds.map(String))"
             >
               接受勾选建议
@@ -325,9 +399,13 @@ window.addEventListener('beforeunload', beforeUnload);
             @row-click="onRowClick"
           >
             <template #status="{ record }">
+              <a-tag v-if="record.needsReview" color="red" style="margin-bottom: 4px">待复核</a-tag>
               <a-tag :color="statusColor(record.status)">
                 {{ statusLabel(record.status) }}
               </a-tag>
+              <div v-if="record.needsReview && record.suggestedStatus" style="margin-top: 4px; color: #d25f00; font-size: 11px">
+                建议改为 {{ statusLabel(record.suggestedStatus) }}
+              </div>
               <div style="margin-top: 6px; color: #86909c; font-size: 11px">
                 相似度 {{ Math.round(record.similarity * 100) }}%
               </div>
@@ -346,6 +424,12 @@ window.addEventListener('beforeunload', beforeUnload);
 
             <template #align="{ record }">
               <a-space direction="vertical" size="mini">
+                <a-button v-if="record.needsReview" size="mini" type="primary" @click.stop="applySuggestion(record.id)">
+                  采纳建议
+                </a-button>
+                <a-button v-if="record.needsReview" size="mini" @click.stop="keepStatus(record.id)">
+                  保持原判
+                </a-button>
                 <a-button size="mini" @click.stop="shiftPairing(record.id, -1)">配对上移</a-button>
                 <a-button size="mini" @click.stop="shiftPairing(record.id, 1)">配对下移</a-button>
                 <a-button size="mini" @click.stop="moveRow(record.id, -1)">整行上移</a-button>
